@@ -43,12 +43,15 @@ type ChatRequest struct {
 }
 
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	Name       string     `json:"name,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type StreamEvent struct {
-	Type      string `json:"type"` // thinking | content | usage | done | error | meta | metrics
+	Type      string `json:"type"` // thinking | content | usage | done | error | meta | tool_* | search_*
 	Text      string `json:"text,omitempty"`
 	Error     string `json:"error,omitempty"`
 	Usage     *Usage `json:"usage,omitempty"`
@@ -197,8 +200,10 @@ func (c *Client) StreamChat(
 	})
 
 	if useResponses {
+		// Responses path: no agent tools yet — plain stream
 		return c.streamResponses(ctx, token, settings, model, effort, req, emit)
 	}
+	// Tool-capable agent loop is orchestrated by the app via StreamChatWithTools.
 	return c.streamChatCompletions(ctx, token, settings, model, effort, req, emit)
 }
 

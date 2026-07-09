@@ -42,7 +42,6 @@ const state = {
   shellBuilt: false,
   sessionCost: 0,
   sessionLat: null,
-  webSearch: false,
   // custom dropdowns
   picks: {
     effort: "high",
@@ -369,14 +368,11 @@ function ensureShell() {
             <textarea id="prompt" rows="1" placeholder="Pergunte qualquer coisa…"></textarea>
             <div class="composer-row">
               <div class="tools">
-                <button type="button" class="web-toggle" id="web-toggle" title="Busca web (DuckDuckGo)">
-                  <span class="web-ico">⌕</span>
-                  <span>Web</span>
-                </button>
                 <div id="c-account"></div>
                 <div id="c-model"></div>
                 <div id="c-effort"></div>
                 <div id="c-api"></div>
+                <span class="tool-hint" title="O modelo chama web_search sozinho quando precisa">tools: web_search</span>
               </div>
               <button class="send" id="send" title="Enviar">↑</button>
             </div>
@@ -389,12 +385,6 @@ function ensureShell() {
   $("#btn-add").onclick = startLogin;
   $("#btn-stats").onclick = openStatsModal;
   $("#btn-stats-top").onclick = openStatsModal;
-  const webBtn = $("#web-toggle");
-  webBtn.classList.toggle("on", state.webSearch);
-  webBtn.onclick = () => {
-    state.webSearch = !state.webSearch;
-    webBtn.classList.toggle("on", state.webSearch);
-  };
 
   const effortOpts = [
     { value: "low", label: "Low" },
@@ -713,20 +703,23 @@ function paintMessages() {
           </section>
         `;
       }
-      const searchUI = m.search || m.webSearch ? renderSearchPanel(m.search, m.webSearch && m.streaming) : "";
+      const toolsUI = renderToolsPanel(m.tools);
+      const searchUI = m.search ? renderSearchPanel(m.search, m.search.status === "searching") : "";
       const think = m.thinking
         ? `<div class="think">${escapeHtml(m.thinking)}</div>`
         : "";
       const cursor = m.streaming ? `<span class="cursor" aria-hidden="true"></span>` : "";
       const meta = m.meta ? `<div class="turn-meta">${escapeHtml(m.meta)}</div>` : "";
       const answer = renderMarkdown(m.content || "") + cursor;
-      const hasAnswer = !!(m.content && m.content.trim()) || m.streaming;
+      const hasAnswer = !!(m.content && m.content.trim());
+      const showAnswer = hasAnswer || (m.streaming && !m.search?.status && !(m.tools && m.tools.length));
       return `
         <section class="turn turn-assistant" data-i="${i}">
           <div class="turn-label">Grok</div>
+          ${toolsUI}
           ${searchUI}
           ${think}
-          ${hasAnswer || !searchUI ? `<div class="answer md">${answer}</div>` : ""}
+          ${hasAnswer || showAnswer ? `<div class="answer md">${answer || (m.streaming ? cursor : "")}</div>` : m.streaming && (searchUI || toolsUI) ? "" : `<div class="answer md">${answer}</div>`}
           ${meta}
         </section>
       `;
@@ -827,8 +820,8 @@ async function submit() {
     content: "",
     thinking: "",
     streaming: true,
-    webSearch: state.webSearch,
-    search: null, // { query, results, status, abstract, answer }
+    tools: [], // [{id, name, args, status, search}]
+    search: null,
   });
   promptEl.value = "";
   autoGrow(promptEl);
@@ -859,8 +852,6 @@ async function submit() {
     stream: true,
     reasoning_effort: effort,
     api_mode: apiMode,
-    web_search: !!state.webSearch,
-    search_query: text,
   };
 
   // full history for chat mode continuity in UI only; for API send context
@@ -907,6 +898,33 @@ function schedulePaintMessages() {
   });
 }
 
+function renderToolsPanel(tools) {
+  if (!tools || !tools.length) return "";
+  return `
+    <div class="tools-panel">
+      ${tools
+        .map((t) => {
+          const st = t.status || "running";
+          const q = t.query ? `<span class="tool-query">${escapeHtml(t.query)}</span>` : "";
+          return `
+            <div class="tool-row ${st}">
+              <span class="tool-dot"></span>
+              <div class="tool-main">
+                <div class="tool-name">
+                  <span class="tool-pill">tool</span>
+                  <code>${escapeHtml(t.name || "web_search")}</code>
+                  ${st === "running" ? `<span class="search-spin sm"></span>` : st === "done" ? `<span class="tool-ok">done</span>` : ""}
+                </div>
+                ${q}
+              </div>
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
 function renderSearchPanel(search, searching) {
   if (!search && !searching) return "";
   const q = search?.query || "…";
@@ -919,7 +937,7 @@ function renderSearchPanel(search, searching) {
     body = `
       <div class="search-loading">
         <span class="search-spin"></span>
-        <span>Consultando DuckDuckGo…</span>
+        <span>Buscando no DuckDuckGo…</span>
       </div>
       <div class="search-skeleton">
         <div class="sk-row"></div>
@@ -976,13 +994,25 @@ function renderSearchPanel(search, searching) {
   `;
 }
 
+function ensureTool(last, id, name) {
+  if (!last.tools) last.tools = [];
+  let t = last.tools.find((x) => x.id === id);
+  if (!t) {
+    t = { id, name: name || "web_search", status: "running", query: "" };
+    last.tools.push(t);
+  }
+  return t;
+}
+
 function onSearchEvent(type, payload) {
   const last = state.messages.at(-1);
   if (!last || last.role !== "assistant") return;
-  if (!last.search) last.search = { query: "", results: [], status: "searching" };
 
   if (type === "search:start") {
-    last.webSearch = true;
+    const id = payload?.tool_call_id || "search";
+    const t = ensureTool(last, id, "web_search");
+    t.status = "running";
+    t.query = payload?.query || t.query || "";
     last.search = {
       query: payload?.query || "",
       results: [],
@@ -1001,6 +1031,11 @@ function onSearchEvent(type, payload) {
       status: "done",
       provider: payload?.provider || "DuckDuckGo",
     };
+    if (last.tools?.length) {
+      last.tools.forEach((t) => {
+        if (t.name === "web_search") t.status = "done";
+      });
+    }
   } else if (type === "search:error") {
     last.search = {
       ...(last.search || {}),
@@ -1008,17 +1043,73 @@ function onSearchEvent(type, payload) {
       status: "error",
       error: payload?.error || "erro",
     };
+    if (payload?.tool_call_id) {
+      const t = ensureTool(last, payload.tool_call_id, "web_search");
+      t.status = "error";
+    }
   } else if (type === "search:done") {
     if (last.search && last.search.status === "searching") {
       last.search.status = "done";
     }
+  } else if (type === "tool:call") {
+    ensureTool(last, payload?.id || "tool", payload?.name || "web_search");
+  } else if (type === "tool:args") {
+    const t = ensureTool(last, payload?.id || "tool", "web_search");
+    try {
+      const j = JSON.parse(payload?.arguments || "{}");
+      if (j.query) t.query = j.query;
+    } catch (_) {
+      t.query = payload?.arguments || "";
+    }
+  } else if (type === "tool:done") {
+    const t = ensureTool(last, payload?.id || "tool", payload?.name || "web_search");
+    t.status = "done";
   }
   schedulePaintMessages();
+}
+
+function onChatEventTool(ev) {
+  // map chat.event tool_* into tools panel
+  const last = state.messages.at(-1);
+  if (!last || last.role !== "assistant") return false;
+  if (ev.type === "tool_call") {
+    ensureTool(last, ev.id || "tool", ev.text || "web_search");
+    schedulePaintMessages();
+    return true;
+  }
+  if (ev.type === "tool_args") {
+    const t = ensureTool(last, ev.id || "tool", "web_search");
+    try {
+      const j = JSON.parse(ev.text || "{}");
+      if (j.query) t.query = j.query;
+    } catch (_) {
+      if (ev.text) t.query = ev.text;
+    }
+    schedulePaintMessages();
+    return true;
+  }
+  if (ev.type === "search_query") {
+    onSearchEvent("search:start", { query: ev.text, tool_call_id: ev.id, provider: "DuckDuckGo" });
+    return true;
+  }
+  if (ev.type === "tool_done") {
+    const t = ensureTool(last, ev.id || "tool", ev.text || "web_search");
+    t.status = "done";
+    schedulePaintMessages();
+    return true;
+  }
+  if (ev.type === "tool_error") {
+    onSearchEvent("search:error", { error: ev.error, tool_call_id: ev.id });
+    return true;
+  }
+  return false;
 }
 
 function onChatEvent(ev) {
   const last = state.messages.at(-1);
   if (!last || last.role !== "assistant") return;
+
+  if (onChatEventTool(ev)) return;
 
   if (ev.type === "thinking") {
     last.thinking = (last.thinking || "") + (ev.text || "");
@@ -1099,6 +1190,9 @@ function wireEvents() {
   EventsOn("search:results", (p) => onSearchEvent("search:results", p));
   EventsOn("search:error", (p) => onSearchEvent("search:error", p));
   EventsOn("search:done", (p) => onSearchEvent("search:done", p));
+  EventsOn("tool:call", (p) => onSearchEvent("tool:call", p));
+  EventsOn("tool:args", (p) => onSearchEvent("tool:args", p));
+  EventsOn("tool:done", (p) => onSearchEvent("tool:done", p));
   EventsOn("request:active", (req) => {
     state.activeRequest = req;
     paintStatus();

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -483,10 +484,6 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 	if label == "" {
 		label = acc.Email
 	}
-	phase := "thinking"
-	if req.WebSearch {
-		phase = "searching"
-	}
 	a.activeReq = &ActiveRequest{
 		ID:        reqID,
 		AccountID: acc.ID,
@@ -494,7 +491,7 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 		Label:     label,
 		Model:     req.Model,
 		StartedAt: time.Now().UTC().Format(time.RFC3339),
-		Phase:     phase,
+		Phase:     "thinking",
 	}
 	a.mu.Unlock()
 	runtime.EventsEmit(a.ctx, "request:active", a.GetActiveRequest())
@@ -508,61 +505,43 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 			runtime.EventsEmit(a.ctx, "request:active", nil)
 		}()
 
-		// Optional DuckDuckGo web search before model
-		if req.WebSearch && a.websearch != nil {
-			q := strings.TrimSpace(req.SearchQuery)
-			if q == "" {
-				// last user message
-				for i := len(req.Messages) - 1; i >= 0; i-- {
-					if req.Messages[i].Role == "user" && strings.TrimSpace(req.Messages[i].Content) != "" {
-						q = req.Messages[i].Content
-						break
-					}
-				}
-			}
-			if q == "" && strings.TrimSpace(req.Input) != "" {
-				q = req.Input
-			}
-			runtime.EventsEmit(a.ctx, "search:start", map[string]any{
-				"query": q, "provider": "DuckDuckGo",
-			})
-			a.setPhase("searching")
-			searchRes, sErr := a.websearch.Search(ctx, q, 8)
-			if sErr != nil {
-				runtime.EventsEmit(a.ctx, "search:error", map[string]any{"error": sErr.Error(), "query": q})
-			} else if searchRes != nil {
-				runtime.EventsEmit(a.ctx, "search:results", searchRes)
-				ctxBlock := websearch.FormatForPrompt(searchRes)
-				if len(req.Messages) > 0 {
-					// Keep prior history; rewrite last user turn to include sources
-					msgs := make([]upstream.ChatMessage, len(req.Messages))
-					copy(msgs, req.Messages)
-					for i := len(msgs) - 1; i >= 0; i-- {
-						if msgs[i].Role == "user" {
-							msgs[i].Content = ctxBlock + "\n---\nUser question:\n" + msgs[i].Content
-							break
-						}
-					}
-					req.Messages = msgs
-				} else if req.Input != "" {
-					req.Input = ctxBlock + "\n---\nUser question:\n" + req.Input
-				}
-			}
-			runtime.EventsEmit(a.ctx, "search:done", map[string]any{"query": q})
-			a.setPhase("thinking")
-		}
-
-		err := a.upstream.StreamChat(ctx, token, settings, label, acc.Email, req, func(ev upstream.StreamEvent) {
-			if ev.Type == "thinking" {
+		emit := func(ev upstream.StreamEvent) {
+			switch ev.Type {
+			case "thinking":
 				a.setPhase("thinking")
-			} else if ev.Type == "content" {
+			case "content":
 				a.setPhase("content")
+			case "tool_call", "search_query":
+				a.setPhase("searching")
 			}
 			if ev.Account == "" {
 				ev.Account = label
 			}
 			if ev.Email == "" {
 				ev.Email = acc.Email
+			}
+			// Fan-out search UI events from tool protocol
+			switch ev.Type {
+			case "search_query":
+				runtime.EventsEmit(a.ctx, "search:start", map[string]any{
+					"query": ev.Text, "provider": "DuckDuckGo", "tool_call_id": ev.ID,
+				})
+			case "tool_call":
+				runtime.EventsEmit(a.ctx, "tool:call", map[string]any{
+					"id": ev.ID, "name": ev.Text,
+				})
+			case "tool_args":
+				runtime.EventsEmit(a.ctx, "tool:args", map[string]any{
+					"id": ev.ID, "arguments": ev.Text,
+				})
+			case "tool_done":
+				runtime.EventsEmit(a.ctx, "tool:done", map[string]any{
+					"id": ev.ID, "name": ev.Text,
+				})
+			case "tool_error":
+				runtime.EventsEmit(a.ctx, "search:error", map[string]any{
+					"error": ev.Error, "tool_call_id": ev.ID,
+				})
 			}
 			runtime.EventsEmit(a.ctx, "chat:event", ev)
 			if ev.Type == "usage" && ev.Usage != nil {
@@ -594,7 +573,54 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 				runtime.EventsEmit(a.ctx, "usage:update", a.store.UsageSnapshot())
 				runtime.EventsEmit(a.ctx, "stats:sample", sample)
 			}
-		})
+		}
+
+		// Agent tools ON for chat: model decides when to call web_search.
+		// Responses API path stays plain stream (no tools yet).
+		modelID := req.Model
+		if modelID == "" {
+			modelID = settings.DefaultModel
+		}
+		mode := strings.ToLower(req.APIMode)
+		if mode == "" {
+			mode = strings.ToLower(settings.APIMode)
+		}
+		forceTools := mode != "responses" && !strings.Contains(strings.ToLower(modelID), "responses")
+		// normalize model id for upstream
+		if i := strings.Index(strings.ToLower(modelID), "-responses"); i > 0 {
+			modelID = modelID[:i]
+		}
+		if req.ReasoningEffort == "" {
+			req.ReasoningEffort = settings.ReasoningEffort
+		}
+
+		var err error
+		if forceTools {
+			err = a.upstream.StreamChatWithTools(ctx, token, settings, modelID, req.ReasoningEffort, req, emit,
+				func(ctx context.Context, query string) (string, error) {
+					res, err := a.websearch.Search(ctx, query, 8)
+					if err != nil {
+						return "", err
+					}
+					// Pretty UI payload
+					runtime.EventsEmit(a.ctx, "search:results", res)
+					runtime.EventsEmit(a.ctx, "search:done", map[string]any{"query": query})
+					// Compact JSON for the tool role
+					b, _ := json.Marshal(map[string]any{
+						"provider":    res.Provider,
+						"query":       res.Query,
+						"abstract":    res.Abstract,
+						"answer":      res.Answer,
+						"answer_url":  res.AnswerURL,
+						"duration_ms": res.DurationMs,
+						"results":     res.Results,
+					})
+					return string(b), nil
+				},
+			)
+		} else {
+			err = a.upstream.StreamChat(ctx, token, settings, label, acc.Email, req, emit)
+		}
 		if err != nil && ctx.Err() == nil {
 			runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "error", Error: err.Error()})
 			runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "done"})
